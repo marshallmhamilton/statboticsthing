@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Match Monitor</title>
+<style>
+body{font-family:monospace;max-width:900px;margin:10px auto;padding:0 10px}
+header,.picker,.alliances{display:flex;flex-wrap:wrap;gap:12px}
+.row{display:flex;gap:12px;border-bottom:1px solid #ccc;padding:4px 0}
+.row>*{flex:1}
+.detail{padding:4px 12px;background:#eee}
+.list,.evlist{max-height:400px;overflow:auto}
+.ev{display:block;width:100%;text-align:left}
+.row.next,.ev.sel{font-weight:bold}
+.results{border:1px solid #000}
+.results button{display:block;width:100%;text-align:left}
+.grp{display:flex;gap:8px;align-items:end;margin-right:16px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Match Monitor</h1>
+    <div class="status"><span class="dot" id="dot"></span><span id="conn">Connecting…</span></div>
+  </div>
+  <div class="picker">
+    <div class="grp"><div class="field">
+      <label for="myTeam">Your team</label>
+      <input id="myTeam" type="number" min="1" inputmode="numeric" placeholder="Set once">
+    </div>
+    <button class="go" id="setBtn" type="button">Set team</button></div>
+    <div class="grp"><div class="field">
+      <label for="teamNum">View team</label>
+      <input id="teamNum" type="number" min="1" inputmode="numeric" placeholder="e.g. 254">
+    </div>
+    <button class="go" id="go">Load team</button></div>
+    <button class="go" id="demoBtn" type="button">Demo match</button>
+    <div class="field">
+      <label for="search">Search teams by name or number</label>
+      <input id="search" type="search" placeholder="Search teams" autocomplete="off">
+      <div class="results" id="results" hidden></div>
+    </div>
+  </div>
+</header>
+
+<div class="panel team" id="team"><p class="empty">Pick a team.</p></div>
+<div class="panel defcon" id="defcon" hidden></div>
+<main>
+  <section><div class="panel events" id="events" hidden></div></section>
+  <section class="panel matches" id="matches" hidden></section>
+</main>
+
+<script>
+// ---- Settings -------------------------------------------------------------
+const WS_URL = "ws://localhost:9119";
+// Win-chance thresholds for the DEFCON level (first match wins).
+const LEVELS = [
+  {min: 0.70, level: 5, text: "Strong favorite"},
+  {min: 0.55, level: 4, text: "Favored"},
+  {min: 0.45, level: 3, text: "Toss-up"},
+  {min: 0.30, level: 2, text: "Underdog"},
+  {min: 0,    level: 1, text: "Long shot"},
+];
+const COLORS = {5:"--d5",4:"--d4",3:"--d3",2:"--d2",1:"--d1"};
+
+// ---- State ----------------------------------------------------------------
+let ws, team = null, searchTimer = null, nextMatch = null, nextError = "", matches = [], events = [], selEvent = null, demo = false, demoIdx = 0;
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const pct = p => (p * 100).toFixed(1) + "%";
+const fmtTime = t => t ? new Date(t * 1000).toLocaleString([], {weekday:"short", hour:"numeric", minute:"2-digit"}) : "";
+
+// ---- Connection -----------------------------------------------------------
+function send(obj){ if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+// The server keeps the user's own team per connection, so it is sent once on connect
+// (or when the "Your team" field changes). Viewing other teams never touches it.
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v){ try { localStorage.setItem(k, v); } catch {} }
+};
+let myTeam = Number(store.get("myTeam")) || null;
+if (myTeam) $("myTeam").value = myTeam;
+
+function connect(){
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    setConn(true);
+    if (myTeam) send({Type:"SetTeamNumber", Team: myTeam});
+    if (!demo && (team || myTeam)) loadTeam(team || myTeam);
+  };
+  ws.onclose = () => { setConn(false); setTimeout(connect, 2000); };
+  ws.onmessage = e => handle(JSON.parse(e.data));
+}
+function setConn(on){
+  $("dot").classList.toggle("on", on);
+  $("conn").textContent = on ? "Connected" : "Not connected. Start server.py. Retrying…";
+}
+
+function loadTeam(n){
+  team = Number(n);
+  $("teamNum").value = team;
+  demo = false; nextMatch = null; nextError = ""; matches = []; events = []; selEvent = null;
+  $("team").innerHTML = `<h2>Team ${team}</h2><p>Loading…</p>`;
+  $("defcon").hidden = true; $("matches").hidden = true; $("events").hidden = true;
+  send({Type:"GetTeamData", Team: team});
+  send({Type:"GetMatches", Team: team});
+  send({Type:"GetEvents", Team: team});
+}
+
+// Same rule as the server's getNextMatch: matches arrive newest first, so walk until
+// the first completed one and keep the last unplayed match seen (the earliest upcoming).
+function findNext(list){
+  const desc = [...list].sort((a, b) => b.time - a.time);
+  let pick = null;
+  for (const m of desc){ if (m.status === "Completed") break; pick = m; }
+  return pick;
+}
+
+function handle(m){
+  switch (m.Type){
+    case "TeamData": renderTeam(m.Data); break;
+    case "Matches":
+      matches = m.Data || [];
+      nextMatch = findNext(matches);
+      nextError = "No upcoming matches found for this team.";
+      renderDefcon(); renderEvents(); renderMatches(); break;
+    case "Events": events = m.Data || []; renderEvents(); renderMatches(); break;
+    case "SearchResults": renderResults(m.Data || [], m.Query); break;
+  }
+}
+
+// ---- Rendering ------------------------------------------------------------
+function renderTeam(t){
+  if (!t || t.team !== team) return;
+  const r = t.record || {}, e = t.norm_epa || {};
+  $("team").innerHTML = `<h2>Team ${t.team}: ${esc(t.name)}</h2>
+    <p>${esc([t.state, t.country].filter(Boolean).join(", "))} · Rating ${e.current ?? "n/a"} · Record ${r.wins ?? 0}-${r.losses ?? 0}-${r.ties ?? 0}</p>`;
+}
+
+function teamWinProb(m){
+  const p = m.pred && m.pred.red_win_prob;
+  if (p == null) return null;
+  const red = (m.alliances.red.team_keys || []).includes(team);
+  return red ? p : 1 - p;
+}
+function levelFor(p){ return LEVELS.find(l => p >= l.min); }
+
+function allianceHtml(color, a){
+  const mine = (a.team_keys || []).includes(team);
+  const teams = (a.team_keys || []).map(k =>
+    `<button class="tn${k === team ? " me" : ""}" data-team="${k}">${k}</button>`).join(" ");
+  return `<div class="ally ${color}${mine ? " mine" : ""}"><div class="t">${color === "red" ? "Red" : "Blue"} alliance</div>${teams}</div>`;
+}
+
+function renderDefcon(){
+  const box = $("defcon"); box.hidden = false; delete box.dataset.level;
+  const sim = demo ? `<span class="simtag">Simulation</span>` : "";
+  if (!nextMatch){
+    box.style.setProperty("--lvl", "var(--line)");
+    box.innerHTML = `<div class="label">Next match${sim}</div><p class="empty">${esc(nextError || "No upcoming match.")}</p>`;
+    return;
+  }
+  const p = teamWinProb(nextMatch);
+  const when = fmtTime(nextMatch.predicted_time || nextMatch.time);
+  const info = `<div class="label">Next match${sim}</div><div class="mname num">${esc(nextMatch.match_name)}</div>
+    <div class="mevent">${esc(nextMatch.event)}${when ? ", scheduled " + esc(when) : ""}</div>`;
+  const allies = `<div class="alliances">${allianceHtml("red", nextMatch.alliances.red)}${allianceHtml("blue", nextMatch.alliances.blue)}</div>`;
+  if (p == null){
+    box.style.setProperty("--lvl", "var(--line)");
+    box.innerHTML = info + `<p class="empty">No win prediction available for this match yet.</p>` + allies;
+    return;
+  }
+  const L = levelFor(p), c = `var(${COLORS[L.level]})`;
+  box.style.setProperty("--lvl", c); box.dataset.level = L.level;
+  const segs = [5,4,3,2,1].map(n => `<i class="${n >= L.level ? "on" : ""}" style="--c:${c}"></i>`).join("");
+  box.innerHTML = `<div class="hero"><div class="lvlbox"><div class="label">DEFCON</div><div class="lvl num">${L.level}</div><div class="lvltext">${L.text}</div></div>
+    <div>${info}<div class="prob">${pct(p)} chance to win</div>
+    <div class="bar" aria-hidden="true">${segs}</div><div class="scale"><span>5 safest</span><span>1 danger</span></div>${allies}</div></div>`;
+}
+
+function chip(p){
+  if (p == null) return "";
+  const L = levelFor(p);
+  return `<span class="chip" style="--c:var(${COLORS[L.level]})" title="DEFCON ${L.level}">${L.level}</span>`;
+}
+
+function matchDetail(m){
+  const p = teamWinProb(m);
+  if (p == null) return `<div class="empty">No prediction was recorded for this match.</div>`;
+  const mine = (m.alliances.red.team_keys || []).includes(team) ? "red" : "blue";
+  const L = levelFor(p), pr = m.pred, n = x => x == null ? "n/a" : Math.round(x);
+  const mineOf = (r, b) => mine === "red" ? [r, b] : [b, r];
+  const [ps, po] = mineOf(pr.red_score, pr.blue_score);
+  let html = `<div class="dline"><span class="chip big" style="--c:var(${COLORS[L.level]})">${L.level}</span>
+    <div><b>DEFCON ${L.level}: ${L.text}</b><br>${pct(p)} chance for team ${team} (${mine} alliance)</div></div>
+    <div>Predicted score: ${n(ps)}-${n(po)}</div>`;
+  if (m.status === "Completed" && m.result){
+    const [as, ao] = mineOf(m.result.red_score, m.result.blue_score);
+    html += `<div>Actual score: ${n(as)}-${n(ao)}. The predicted winner was ${pr.winner === m.result.winner ? "correct" : "wrong"}.</div>`;
+  }
+  const ep = k => m.pre_epas && m.pre_epas[k] && m.pre_epas[k].epa != null ? m.pre_epas[k].epa.toFixed(1) : "n/a";
+  const side = a => (m.alliances[a].team_keys || []).map(k => `${k}: ${ep(k)}`).join(", ");
+  return html + `<div class="hint">Pre-match EPA. Red: ${side("red")}. Blue: ${side("blue")}.</div>`;
+}
+
+function toggleRow(row){
+  const d = row.nextElementSibling;
+  if (!d || !d.classList.contains("detail")) return;
+  d.hidden = !d.hidden;
+  row.setAttribute("aria-expanded", String(!d.hidden));
+}
+
+function currentEventKey(){ return nextMatch ? nextMatch.event : (matches[0] && matches[0].event); }
+
+function renderEvents(){
+  const box = $("events");
+  if (!events.length){ box.hidden = true; return; }
+  const cur = selEvent || currentEventKey();
+  const date = t => new Date(t * 1000).toLocaleDateString([], {month:"short", day:"numeric"});
+  box.hidden = false;
+  box.innerHTML = `<h2>Events</h2><div class="evlist">` +
+    [...events].sort((a, b) => a.time - b.time).map(e => {
+      const q = (e.record && e.record.qual) || {};
+      const rec = q.count ? `, ${q.wins}-${q.losses}-${q.ties}, rank ${q.rank} of ${q.num_teams}` : "";
+      return `<button class="ev${e.event === cur ? " sel" : ""}" data-event="${esc(e.event)}">
+        <span class="evn">${esc(e.event_name)}</span>
+        <span class="evm">${esc(e.event)}, ${esc(date(e.time))}</span>
+        <span class="evs">${esc(e.status)}${esc(rec)}</span></button>`;
+    }).join("") + `</div>`;
+}
+
+function renderMatches(){
+  const box = $("matches");
+  const ev = selEvent || currentEventKey();
+  if (!ev){ box.hidden = true; return; }
+  const evName = (events.find(x => x.event === ev) || {}).event_name || ev;
+  const list = matches.filter(m => m.event === ev).sort((a, b) => a.time - b.time);
+  box.hidden = false;
+  box.innerHTML = `<h2>Matches at ${esc(evName)}</h2><p class="sub">Team ${team}’s matches at this event${list.length ? "" : ". No matches are scheduled yet."}</p><div class="list">` +
+    list.map(m => {
+      const done = m.status === "Completed" && m.result;
+      const mine = (m.alliances.red.team_keys || []).includes(team) ? "red" : "blue";
+      let out = "";
+      if (done){
+        const won = m.result.winner === mine, tie = m.result.winner === "tie";
+        out = `${chip(teamWinProb(m))}<span class="${tie ? "" : won ? "win" : "loss"}">${tie ? "T" : won ? "W" : "L"} ${m.result.red_score}-${m.result.blue_score}</span>`;
+      } else {
+        const p = teamWinProb(m);
+        out = p == null ? "" : chip(p) + pct(p);
+      }
+      const isNext = nextMatch && m.key === nextMatch.key;
+      const t = k => k.map(x => `<button class="tn${x === team ? " me" : ""}" data-team="${x}">${x}</button>`).join(" ");
+      return `<div class="row${isNext ? " next" : ""}" role="button" tabindex="0" aria-expanded="false"><div class="nm">${esc(m.match_name)}<div class="tm">${esc(fmtTime(m.predicted_time || m.time))}</div></div>
+        <div class="r">${t(m.alliances.red.team_keys)}</div><div class="b">${t(m.alliances.blue.team_keys)}</div><div class="out">${out}</div></div><div class="detail" hidden>${matchDetail(m)}</div>`;
+    }).join("") + `</div>`;
+  const n = box.querySelector(".row.next"); if (n) n.scrollIntoView({block:"nearest"});
+}
+
+// ---- Search ---------------------------------------------------------------
+function renderResults(items, q){
+  const box = $("results");
+  if (q !== $("search").value.trim()) return;
+  let html = /^\d+$/.test(q) ? `<button data-team="${esc(q)}"><b>${esc(q)}</b><span>Go to team ${esc(q)}</span></button>` : "";
+  html += items.filter(t => String(t.team) !== q).map(t => `<button data-team="${t.team}"><b>${t.team}</b><span>${esc(t.name)}</span></button>`).join("");
+  box.innerHTML = html || `<div class="note">No teams found.</div>`;
+  box.hidden = false;
+}
+$("search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  const q = $("search").value.trim();
+  if (!q){ $("results").hidden = true; return; }
+  searchTimer = setTimeout(() => {
+    send({Type:"SearchTeams", Query:q});
+    if (/^\d+$/.test(q)) renderResults([], q);
+    setTimeout(() => { if ($("results").hidden && $("search").value.trim() === q)
+      { $("results").innerHTML = `<div class="note">No response. Search needs the SearchTeams update in server.py.</div>`; $("results").hidden = false; } }, 3000);
+  }, 250);
+});
+$("search").addEventListener("keydown", e => {
+  if (e.key === "Enter"){ const b = $("results").querySelector("button"); if (b) b.click(); }
+});
+
+// ---- Wiring ---------------------------------------------------------------
+document.addEventListener("click", e => {
+  const b = e.target.closest("[data-team]");
+  if (b){ $("results").hidden = true; $("search").value = ""; loadTeam(b.dataset.team); return; }
+  const ev = e.target.closest("[data-event]");
+  if (ev){ selEvent = ev.dataset.event; renderEvents(); renderMatches(); return; }
+  const row = e.target.closest(".row");
+  if (row) toggleRow(row);
+  if (!e.target.closest(".field")) $("results").hidden = true;
+});
+document.addEventListener("keydown", e => {
+  const row = e.target.classList && e.target.classList.contains("row") ? e.target : null;
+  if (row && (e.key === "Enter" || e.key === " ")){ e.preventDefault(); toggleRow(row); }
+});
+function setMyTeam(){
+  const v = Number($("myTeam").value);
+  if (!v) return;
+  myTeam = v; store.set("myTeam", v);
+  send({Type:"SetTeamNumber", Team: myTeam});
+  document.querySelector("label[for=myTeam]").textContent = "Your team (set: " + v + ")";
+  if (!team) loadTeam(myTeam);
+}
+$("setBtn").addEventListener("click", setMyTeam);
+$("myTeam").addEventListener("keydown", e => { if (e.key === "Enter") setMyTeam(); });
+if (myTeam) document.querySelector("label[for=myTeam]").textContent = "Your team (set: " + myTeam + ")";
+$("go").addEventListener("click", () => { const v = $("teamNum").value; if (v) loadTeam(v); });
+$("teamNum").addEventListener("keydown", e => { if (e.key === "Enter") $("go").click(); });
+
+// Fake next match for trying the display. Each click steps through DEFCON 5 down to 1.
+const DEMO_PROBS = [0.82, 0.62, 0.50, 0.37, 0.14];
+function showDemo(){
+  const p = DEMO_PROBS[demoIdx++ % DEMO_PROBS.length];
+  const t = Math.floor(Date.now() / 1000) + 900;
+  demo = true; team = 1234; events = []; selEvent = null; nextError = "";
+  nextMatch = {key:"demo_qm42", event:"2026demo", match_name:"Qual 42", time:t, predicted_time:t, status:"Upcoming",
+    alliances:{red:{team_keys:[1234,5678,9012]}, blue:{team_keys:[3456,7890,2468]}},
+    pred:{winner: p >= .5 ? "red" : "blue", red_win_prob:p, red_score:60 + p * 60, blue_score:120 - p * 60}};
+  matches = [nextMatch];
+  renderTeam({team:1234, name:"Demo Team", state:"XX", country:"Simulation", record:{wins:5, losses:3, ties:0}, norm_epa:{current:1500}});
+  renderDefcon(); renderEvents(); renderMatches();
+}
+$("demoBtn").addEventListener("click", showDemo);
+
+connect();
+</script>
+</body>
+</html>
